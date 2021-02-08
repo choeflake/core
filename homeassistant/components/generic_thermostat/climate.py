@@ -68,7 +68,7 @@ SUPPORT_FLAGS = SUPPORT_TARGET_TEMPERATURE
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
         vol.Required(CONF_HEATER): cv.entity_id,
-        vol.Required(CONF_SENSOR): cv.entity_id,
+        vol.Required(CONF_SENSOR): cv.entity_ids,
         vol.Optional(CONF_AC_MODE): cv.boolean,
         vol.Optional(CONF_MAX_TEMP): vol.Coerce(float),
         vol.Optional(CONF_MIN_DUR): cv.positive_time_period,
@@ -96,7 +96,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
 
     name = config.get(CONF_NAME)
     heater_entity_id = config.get(CONF_HEATER)
-    sensor_entity_id = config.get(CONF_SENSOR)
+    sensor_entity_ids = config.get(CONF_SENSOR)
     min_temp = config.get(CONF_MIN_TEMP)
     max_temp = config.get(CONF_MAX_TEMP)
     target_temp = config.get(CONF_TARGET_TEMP)
@@ -115,7 +115,7 @@ async def async_setup_platform(hass, config, async_add_entities, discovery_info=
             GenericThermostat(
                 name,
                 heater_entity_id,
-                sensor_entity_id,
+                sensor_entity_ids,
                 min_temp,
                 max_temp,
                 target_temp,
@@ -140,7 +140,7 @@ class GenericThermostat(ClimateEntity, RestoreEntity):
         self,
         name,
         heater_entity_id,
-        sensor_entity_id,
+        sensor_entity_ids,
         min_temp,
         max_temp,
         target_temp,
@@ -157,7 +157,7 @@ class GenericThermostat(ClimateEntity, RestoreEntity):
         """Initialize the thermostat."""
         self._name = name
         self.heater_entity_id = heater_entity_id
-        self.sensor_entity_id = sensor_entity_id
+        self.sensor_entity_ids = sensor_entity_ids
         self.ac_mode = ac_mode
         self.min_cycle_duration = min_cycle_duration
         self._cold_tolerance = cold_tolerance
@@ -190,7 +190,7 @@ class GenericThermostat(ClimateEntity, RestoreEntity):
         # Add listener
         self.async_on_remove(
             async_track_state_change_event(
-                self.hass, [self.sensor_entity_id], self._async_sensor_changed
+                self.hass, self.sensor_entity_ids, self._async_sensor_changed
             )
         )
         self.async_on_remove(
@@ -209,12 +209,16 @@ class GenericThermostat(ClimateEntity, RestoreEntity):
         @callback
         def _async_startup(*_):
             """Init on startup."""
-            sensor_state = self.hass.states.get(self.sensor_entity_id)
-            if sensor_state and sensor_state.state not in (
-                STATE_UNAVAILABLE,
-                STATE_UNKNOWN,
-            ):
-                self._async_update_temp(sensor_state)
+            update_at_start = True
+            for sensor in self.sensor_entity_ids:
+                sensor_state = self.hass.states.get(sensor)
+                if sensor_state and sensor_state.state not in (
+                    STATE_UNAVAILABLE,
+                    STATE_UNKNOWN,
+                ):
+                    update_at_start = False
+            if update_at_start:
+                self._async_update_temp()
                 self.async_write_ha_state()
 
         if self.hass.state == CoreState.running:
@@ -379,11 +383,7 @@ class GenericThermostat(ClimateEntity, RestoreEntity):
 
     async def _async_sensor_changed(self, event):
         """Handle temperature changes."""
-        new_state = event.data.get("new_state")
-        if new_state is None or new_state.state in (STATE_UNAVAILABLE, STATE_UNKNOWN):
-            return
-
-        self._async_update_temp(new_state)
+        self._async_update_temp()
         await self._async_control_heating()
         self.async_write_ha_state()
 
@@ -396,10 +396,42 @@ class GenericThermostat(ClimateEntity, RestoreEntity):
         self.async_write_ha_state()
 
     @callback
-    def _async_update_temp(self, state):
+    def _parse_float(self, val):
+        if val is None:
+            return None
+        try:
+            return float(val)
+        except ValueError:
+            return None
+
+    @callback
+    def _async_update_temp(self):
         """Update thermostat with latest state from sensor."""
         try:
-            self._cur_temp = float(state.state)
+            number_of_sensors = 0
+            total_of_sensors = 0
+            for sensor in self.sensor_entity_ids:
+                sensor_state = self.hass.states.get(sensor)
+                add_temp = None
+                if sensor_state and sensor_state.state not in (
+                    STATE_UNAVAILABLE,
+                    STATE_UNKNOWN,
+                ):
+                    attributes = sensor_state.attributes
+                    if "current_temperature" in attributes:
+                        current_sensor_temp = attributes["current_temperature"]
+                        add_temp = self._parse_float(current_sensor_temp)
+                    else:
+                        add_temp = self._parse_float(sensor_state.state)
+
+                    if add_temp is not None:
+                        number_of_sensors += 1
+                        total_of_sensors += add_temp
+
+            if number_of_sensors > 0:
+                self._cur_temp = total_of_sensors / number_of_sensors
+            else:
+                self._cur_temp = None
         except ValueError as ex:
             _LOGGER.error("Unable to update from sensor: %s", ex)
 
